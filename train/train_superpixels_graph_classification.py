@@ -1,0 +1,232 @@
+"""
+    Utility functions for training one epoch 
+    and evaluating one epoch
+"""
+import torch
+import torch.nn as nn
+import math
+
+from train.metrics import accuracy_MNIST_CIFAR as accuracy
+
+from nets.superpixels_graph_classification.diffpool import HSIC_weight
+import dgl
+from tqdm import tqdm
+import pickle
+"""
+    For GCNs
+"""
+cls_criterion = torch.nn.BCEWithLogitsLoss(reduce=False)
+reg_criterion = torch.nn.MSELoss(reduce=False)
+import sys
+softmax = nn.Softmax(0)
+
+def train_epoch_sparse(model, optimizer, device, data_loader, epoch, task_type):
+    model.train()
+    epoch_loss = 0
+    epoch_train_acc = 0
+    nb_data = 0
+    gpu_mem = 0
+    for iter, (batch_graphs, batch_labels) in enumerate(data_loader):
+        batch_graphs = batch_graphs.to(device)
+        batch_x = batch_graphs.ndata['feat'].float().to(device)  # num x feat
+        batch_e = batch_graphs.edata['feat'].long().to(device)
+        batch_labels = batch_labels.to(device)                   
+        optimizer.zero_grad()        
+        #batch_scores, embed = model.forward(batch_graphs)
+        
+        #batch_scores = model.forward(batch_graphs, batch_x)
+        batch_scores, embed = model.forward(batch_graphs, batch_x, batch_e)
+        is_labeled = batch_labels == batch_labels
+        tmp = torch.sum(is_labeled, 1) == is_labeled.size(1)
+        
+        if 'classification' in task_type:
+            loss = cls_criterion(batch_scores.to(torch.float32)[tmp], batch_labels.to(torch.float32)[tmp]).mean()
+        else:
+            loss = reg_criterion(batch_scores.to(torch.float32)[is_labeled], batch_labels.to(torch.float32)[is_labeled]).mean()
+        loss.backward()
+        optimizer.step()
+        epoch_loss += loss.detach().item()
+        nb_data += batch_labels.size(0)
+    epoch_loss /= (iter + 1)
+    epoch_train_acc /= nb_data    
+    return epoch_loss, epoch_train_acc, optimizer
+
+criterion = nn.CrossEntropyLoss(reduction='none')
+def adjust_learning_rate_bl(optimizer, epoch, lrbl):
+    """Sets the learning rate to the initial LR decayed by 10 every 30 epochs"""
+    lr = lrbl * (0.1 ** (epoch // 30))
+    for param_group in optimizer.param_groups:
+        param_group['lr'] = lr
+
+
+def train_epoch_sparse_HSIC(model, optimizer,  embedding_size, assign_num, device, data_loader, epoch, lrbl, lambdap, lambda_decay_rate, lambda_decay_epoch, min_lambda_times, task_type):
+    epoch_loss = 0
+    epoch_train_acc = 0
+    nb_data = 0
+    gpu_mem = 0
+    embedding_memory = []
+    weights_memory = []
+    for iter, (batch_graphs, batch_labels) in enumerate(data_loader):
+        batch_graphs = batch_graphs.to(device)
+        batch_x = batch_graphs.ndata['feat'].float().to(device)  # num x feat
+        batch_e = batch_graphs.edata['feat'].long().to(device)
+
+        batch_labels = batch_labels.to(device)                   
+        optimizer.zero_grad()
+        model.train()
+        
+        batch_scores, cfeatures = model.forward(batch_graphs, batch_x, batch_e)
+        is_labeled = batch_labels == batch_labels
+
+        tmp = torch.sum(is_labeled, 1) == is_labeled.size(1)
+        #batch_scores, cfeatures = model.forward(batch_graphs)
+        pre_features = model.pre_features
+        pre_weights = model.pre_weights
+        if epoch==0 and iter ==0:
+            first=True
+        else:
+            first=False
+        HSIC_reg = HSIC_weight(cfeatures[tmp], pre_features, pre_weights, embedding_size, torch.sum(tmp), assign_num, first=first).cuda()
+        #optimizer_weight = torch.optim.SGD(HSIC_reg.parameters(), lr=lrbl, momentum=0.9)
+        
+        optimizer_weight = torch.optim.Adam(HSIC_reg.parameters(), lr=lrbl)
+
+        #pre_weight = torch.zeros_like(batch_labels)
+        deltas = []
+        lossbs = []
+        for it in range(50):
+            #adjust_learning_rate_bl(optimizer_weight, epoch, lrbl)
+            optimizer_weight.zero_grad()
+            loss, lossb = HSIC_reg(lambdap, epoch, lambda_decay_rate, lambda_decay_epoch, min_lambda_times, first=first)
+            loss.backward()
+            optimizer_weight.step()
+
+            weights = HSIC_reg.weights
+            #weights = torch.reshape(weights, batch_labels.size())
+            #pre_weight = weights
+        weights = HSIC_reg.weights
+        #print("weights", weights)
+        #if epoch == 0 and iter < 10:
+        #    pre_features = (pre_features * iter + cfeatures) / (iter + 1)
+        #    pre_weights = (pre_weights * iter + weights) / (iter + 1)
+        #else:
+        #    pre_features = pre_features * 0.9 + cfeatures * 0.1
+        #    pre_weights = pre_weights * 0.9 + weights * 0.1
+        #model.pre_features.data.copy_(pre_features)
+        #model.pre_weights.data.copy_(pre_weights)
+
+        for it in range(1):
+            #model.train()
+            #batch_scores, embed = model.forward(batch_graphs, batch_x, batch_e)
+            optimizer.zero_grad()
+            weight = softmax(weights.detach().clone())
+            if 'classification' in task_type:
+                loss = cls_criterion(batch_scores.to(torch.float32)[tmp], batch_labels.to(torch.float32)[tmp])*weight.to(device)
+            else:
+                loss = reg_criterion(batch_scores.to(torch.float32)[is_labeled], batch_labels.to(torch.float32)[is_labeled]).view(weight.size(0), -1)*weight.to(device)
+            #loss = criterion(batch_scores, batch_labels) * weight.to(device)
+            loss = loss.sum()
+            loss.backward()
+            optimizer.step()
+        epoch_loss += loss.detach().item()
+        nb_data += batch_labels.size(0)
+    epoch_loss /= (iter + 1)
+    epoch_train_acc = 0
+    return epoch_loss, epoch_train_acc, optimizer
+
+
+def generate_saved_data(model, device, data_loader, epoch, max_num_nodes_train):
+    model.eval()
+    predictions = []
+    with torch.no_grad():
+        for iter, (batch_graphs, batch_labels) in enumerate(data_loader):
+            batch_labels = batch_labels            
+            if iter == 0:
+                graphs = batch_graphs
+                labels = batch_labels
+            else:
+                print("graphs", graphs)
+                print("batch_graphs", batch_graphs)
+                graphs = torch.cat((graphs, batch_graphs), axis=0)
+                labels = torch.cat((labels, batch_labels), axis=0)
+    print("graphs", graphs.shape)
+    print("labels", labels.shape)
+    return graphs, labels
+
+def evaluate_network_sparse(model, device, data_loader, epoch):
+    model.eval()
+    epoch_test_loss = 0
+    epoch_test_acc = 0
+    nb_data = 0
+    predictions = []
+    with torch.no_grad():
+        for iter, (batch_graphs, batch_labels) in enumerate(data_loader):
+            batch_graphs = batch_graphs.to(device)
+            batch_x = batch_graphs.ndata['feat'].float().to(device)
+            batch_e = batch_graphs.edata['feat'].to(device)
+            batch_labels = batch_labels.to(device)           
+            #batch_scores = model.forward(batch_graphs, batch_x, None)
+            #batch_scores = model.forward(batch_graphs, batch_x, batch_snorm_n, batch_snorm_e)
+            batch_scores = model.forward(batch_graphs, batch_x, batch_e)
+            predictions += batch_scores.cpu().detach().numpy().tolist()
+            loss = model.loss(batch_scores, batch_labels) 
+            epoch_test_loss += loss.detach().item()
+            epoch_test_acc += accuracy(batch_scores, batch_labels)
+            nb_data += batch_labels.size(0)
+        epoch_test_loss /= (iter + 1)
+        epoch_test_acc /= nb_data
+        
+    return epoch_test_loss, epoch_test_acc
+
+
+
+
+"""
+    For WL-GNNs
+"""
+def train_epoch_dense(model, optimizer, device, data_loader, epoch, batch_size):
+    model.train()
+    epoch_loss = 0
+    epoch_train_acc = 0
+    nb_data = 0
+    gpu_mem = 0
+    optimizer.zero_grad()
+    for iter, (x_with_node_feat, labels) in enumerate(data_loader):
+        x_with_node_feat = x_with_node_feat.to(device)
+        labels = labels.to(device)
+        
+        scores = model.forward(x_with_node_feat)
+        loss = model.loss(scores, labels) 
+        loss.backward()
+        
+        if not (iter%batch_size):
+            optimizer.step()
+            optimizer.zero_grad()
+            
+        epoch_loss += loss.detach().item()
+        epoch_train_acc += accuracy(scores, labels)
+        nb_data += labels.size(0)
+    epoch_loss /= (iter + 1)
+    epoch_train_acc /= nb_data
+    
+    return epoch_loss, epoch_train_acc, optimizer
+
+def evaluate_network_dense(model, device, data_loader, epoch):
+    model.eval()
+    epoch_test_loss = 0
+    epoch_test_acc = 0
+    nb_data = 0
+    with torch.no_grad():
+        for iter, (x_with_node_feat, labels) in enumerate(data_loader):
+            x_with_node_feat = x_with_node_feat.to(device)
+            labels = labels.to(device)
+            
+            scores = model.forward(x_with_node_feat)
+            loss = model.loss(scores, labels) 
+            epoch_test_loss += loss.detach().item()
+            epoch_test_acc += accuracy(scores, labels)
+            nb_data += labels.size(0)
+        epoch_test_loss /= (iter + 1)
+        epoch_test_acc /= nb_data
+        
+    return epoch_test_loss, epoch_test_acc
