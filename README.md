@@ -9,4 +9,4 @@ Shaohua Fan: fanshaohua@bupt.edu.cn
 
 Note that
 
-If you want to use stableGNN on other non-molecule datasets, replace https://github.com/googlebaba/StableGNN/blob/c7ca1a3dca805ad1238dc452b1a225216014323a/nets/superpixels_graph_classification/diffpool_net.py#L176 with self.embedding_h(h)
+If you want to use stableGNN on other non-molecule datasets, replace https://github.com/googlebaba/StableGNN/blob/c7ca1a3dca805ad1238dc452b1a225216014323a/nets/superpixels_graph_classification/diffpool_net.py#L176 with h= self.embedding_h(h)
