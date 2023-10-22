@@ -5,7 +5,7 @@ Paper:https://arxiv.org/pdf/2111.10657.pdf
 
 Connection
 
-Shaohua Fan: fanshaohua@bupt.edu.cn
+Shaohua Fan: fanshaohua@bupt.cn
 
 Note that
 
